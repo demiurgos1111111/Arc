@@ -106,6 +106,9 @@ jobs:
           patch("src/graphics/opengl/OpenGLUtil.h",
           "#if ARX_HAVE_EPOXY\n#include <epoxy/gl.h>\n",
           "#if defined(__EMSCRIPTEN__)\n#define GL_GLEXT_PROTOTYPES 1\n#include <GL/gl.h>\n#include <GL/glext.h>\n#elif ARX_HAVE_EPOXY\n#include <epoxy/gl.h>\n")
+          # 7. HRTF: the Emscripten OpenAL headers lack LPALCRESETDEVICESOFT, so keep that feature off
+          patch(cm, "\tcheck_symbol_exists(ALC_SOFT_HRTF \"alext.h\" ARX_HAVE_OPENAL_HRTF)\n",
+          "\tif(NOT EMSCRIPTEN)\n\tcheck_symbol_exists(ALC_SOFT_HRTF \"alext.h\" ARX_HAVE_OPENAL_HRTF)\n\tendif()\n")
           print("all patches applied")
           ARX_EOF
           cat > web/index.html <<'ARX_EOF'
@@ -275,6 +278,19 @@ jobs:
           ARX_EOF
           python3 patch_arx.py "$PWD/arx-src" "$PWD/hostinc"
 
+      - name: Diagnóstico do código (para eu ajustar os patches)
+        if: always()
+        run: |
+          {
+            echo '=== OpenGLUtil.cpp linhas 135-200 ==='
+            nl -ba arx-src/src/graphics/opengl/OpenGLUtil.cpp | sed -n '135,200p'
+            echo '=== usos de EPOXY/GLEW ==='
+            grep -rn 'ARX_HAVE_EPOXY\|ARX_HAVE_GLEW' arx-src/src | cut -c1-140
+            echo '=== OpenALBackend.cpp linhas 215-250 ==='
+            nl -ba arx-src/src/audio/openal/OpenALBackend.cpp | sed -n '215,250p'
+          } > diag.txt 2>&1 || true
+          cat diag.txt
+
       - name: Configurar (CMake + Emscripten)
         run: |
           set -o pipefail
@@ -322,6 +338,8 @@ jobs:
               grep -E 'FAILED:|error:|undefined symbol|fatal' build.log | cut -c1-240 | head -n 80
               echo '--- últimas linhas ---'
               tail -n 8 build.log | cut -c1-240
+              echo '--- diagnóstico do código ---'
+              cat diag.txt
             else
               tail -n 60 configure.log | cut -c1-240
             fi
