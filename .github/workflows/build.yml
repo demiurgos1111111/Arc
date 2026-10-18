@@ -109,6 +109,10 @@ jobs:
           # 7. HRTF: the Emscripten OpenAL headers lack LPALCRESETDEVICESOFT, so keep that feature off
           patch(cm, "\tcheck_symbol_exists(ALC_SOFT_HRTF \"alext.h\" ARX_HAVE_OPENAL_HRTF)\n",
           "\tif(NOT EMSCRIPTEN)\n\tcheck_symbol_exists(ALC_SOFT_HRTF \"alext.h\" ARX_HAVE_OPENAL_HRTF)\n\tendif()\n")
+          # 8. OpenGLInfo::has(): without epoxy/GLEW, read the extension list from GL itself
+          patch("src/graphics/opengl/OpenGLUtil.cpp",
+          "bool supported = glewIsSupported(extension);\n",
+          "bool supported = glewIsSupported(extension);\n\t\t#else\n\t\tconst char * exts = reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));\n\t\tbool supported = exts && std::string(exts).find(extension) != std::string::npos;\n")
           print("all patches applied")
           ARX_EOF
           cat > web/index.html <<'ARX_EOF'
@@ -282,12 +286,15 @@ jobs:
         if: always()
         run: |
           {
-            echo '=== OpenGLUtil.cpp linhas 135-200 ==='
-            nl -ba arx-src/src/graphics/opengl/OpenGLUtil.cpp | sed -n '135,200p'
-            echo '=== usos de EPOXY/GLEW ==='
-            grep -rn 'ARX_HAVE_EPOXY\|ARX_HAVE_GLEW' arx-src/src | cut -c1-140
-            echo '=== OpenALBackend.cpp linhas 215-250 ==='
-            nl -ba arx-src/src/audio/openal/OpenALBackend.cpp | sed -n '215,250p'
+            R=arx-src/src/graphics/opengl/OpenGLRenderer.cpp
+            echo '=== OpenGLRenderer.cpp 80-100 e 185-225 ==='
+            nl -ba $R | sed -n '80,100p;185,225p'
+            echo '=== OpenGLRenderer.cpp 305-315 e 380-410 ==='
+            nl -ba $R | sed -n '305,315p;380,410p'
+            echo '=== SDL2Window.cpp 415-430 e 478-525 ==='
+            nl -ba arx-src/src/window/SDL2Window.cpp | sed -n '415,430p;478,525p'
+            echo '=== funcoes GL que o Emscripten pode nao ter ==='
+            grep -rn 'glFogCoord\|GL_FOG_COORD\|glSecondaryColor\|GL_CLAMP_TO_BORDER\|glBlendEquation\|glDrawRangeElements\|glMapBuffer\|GL_TEXTURE_LOD_BIAS\|glGetTexImage\|glPolygonMode' arx-src/src/graphics/opengl | cut -c1-150 | head -40
           } > diag.txt 2>&1 || true
           cat diag.txt
 
