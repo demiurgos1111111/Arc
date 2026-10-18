@@ -159,7 +159,9 @@ jobs:
             });
           })();
 
-          function log(t) { var l = $('log'); l.textContent += t + '\n'; l.scrollTop = l.scrollHeight; }
+          function log(t) { var l = $('log'); l.textContent = (l.textContent + t + '\n').slice(-6000); l.scrollTop = l.scrollHeight; }
+          window.addEventListener('error', function (e) { log('JS: ' + e.message); });
+          window.addEventListener('unhandledrejection', function (e) { log('JS: ' + (e.reason && e.reason.message || e.reason)); });
 
           $('pick').onchange = function (e) {
             picked = Array.prototype.slice.call(e.target.files).filter(function (f) { return /\.pak$/i.test(f.name); });
@@ -202,6 +204,10 @@ jobs:
             $('canvas').style.display = 'block';
             $('hud').style.display = 'block';
             setupTouch();
+            var lgEl = $('log'); document.body.appendChild(lgEl);
+            lgEl.style.cssText = 'position:fixed;left:6px;top:6px;right:6px;max-height:38vh;overflow:auto;z-index:9;color:#9f9;background:rgba(0,0,0,.55);font:11px monospace;white-space:pre-wrap;pointer-events:none';
+            var lg = document.createElement('div'); lg.textContent = 'Log'; $('btns').appendChild(lg);
+            lg.addEventListener('touchstart', function (e) { e.preventDefault(); lgEl.style.display = lgEl.style.display === 'none' ? 'block' : 'none'; }, { passive: false });
             Module.callMain(['-d', '/game', '-u', '/user', '-c', '/user']);
           }
 
@@ -323,7 +329,17 @@ jobs:
       - name: Compilar
         run: |
           set -o pipefail
+          sed -i 's/-sEXPORTED_RUNTIME_METHODS=FS,callMain/-sEXPORTED_RUNTIME_METHODS=FS,callMain -sERROR_ON_UNDEFINED_SYMBOLS=0 -Wl,--error-limit=0/' build/build.ninja
+          grep -c 'ERROR_ON_UNDEFINED_SYMBOLS' build/build.ninja
           cmake --build build -j"$(nproc)" -- -k 0 2>&1 | tee build.log
+
+      - name: Funções GL que faltam (lista)
+        if: always()
+        run: |
+          set +e
+          grep -o 'undefined symbol: [A-Za-z0-9_]*' build.log | sort -u > missing.txt
+          echo "faltando: $(wc -l < missing.txt)"
+          cat missing.txt
 
       - name: Juntar arquivos do site
         run: |
