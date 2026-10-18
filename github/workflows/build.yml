@@ -32,8 +32,10 @@ jobs:
       - name: Descompactar e aplicar patches
         run: |
           set -e
-          unzip -q ArxLibertatis-1_2_1.zip -d unz
-          mv unz/ArxLibertatis-1.2.1 arx-src
+          ZIP="$(ls ArxLibertatis*.zip | head -n1)"
+          echo "Usando $ZIP"
+          unzip -q "$ZIP" -d unz
+          mv unz/ArxLibertatis-* arx-src
           mkdir -p web
           cat > patch_arx.py <<'ARX_EOF'
           #!/usr/bin/env python3
