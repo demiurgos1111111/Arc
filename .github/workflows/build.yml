@@ -279,11 +279,16 @@ jobs:
         run: |
           set -o pipefail
           COMMON="-O2 -pthread -fexceptions -sUSE_SDL=2 -sUSE_ZLIB=1 -sUSE_FREETYPE=1"
+          EMROOT="$(dirname "$(readlink -f "$(command -v emcc)")")"
+          AL_H="$(find "$EMROOT" -maxdepth 6 -path '*/AL/al.h' -print -quit)"
+          echo "al.h do Emscripten: $AL_H"
+          test -n "$AL_H"
+          ALINC="$(dirname "$AL_H")"
           emcmake cmake -S arx-src -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_EXECUTABLE_SUFFIX=.js \
-            -DCMAKE_C_FLAGS="$COMMON" \
-            -DCMAKE_CXX_FLAGS="$COMMON" \
+            -DCMAKE_C_FLAGS="$COMMON -isystem $ALINC" \
+            -DCMAKE_CXX_FLAGS="$COMMON -isystem $ALINC" \
             -DCMAKE_EXE_LINKER_FLAGS="$COMMON -lopenal -sLEGACY_GL_EMULATION=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2 -sASYNCIFY=1 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sFORCE_FILESYSTEM=1 -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 -sEXPORTED_RUNTIME_METHODS=FS,callMain" \
             -DBUILD_TOOLS=OFF -DBUILD_CRASHHANDLER=OFF -DBUILD_CRASHREPORTER=OFF \
             -DBUILD_IO_LIBRARY=OFF -DBUILD_TESTS=OFF -DBUILD_PROFILER=OFF \
@@ -295,7 +300,7 @@ jobs:
       - name: Compilar
         run: |
           set -o pipefail
-          cmake --build build -j"$(nproc)" 2>&1 | tee build.log
+          cmake --build build -j"$(nproc)" -- -k 0 2>&1 | tee build.log
 
       - name: Juntar arquivos do site
         run: |
@@ -308,10 +313,20 @@ jobs:
       - name: Resumo do erro (se falhou)
         if: failure()
         run: |
-          echo '### Últimas linhas do log' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          (tail -n 60 build.log 2>/dev/null || tail -n 60 configure.log 2>/dev/null || echo 'sem log') >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          set +e
+          set +o pipefail
+          {
+            echo '### Erros da compilação'
+            echo '```'
+            if [ -f build.log ]; then
+              grep -E 'FAILED:|error:|undefined symbol|fatal' build.log | cut -c1-240 | head -n 80
+              echo '--- últimas linhas ---'
+              tail -n 8 build.log | cut -c1-240
+            else
+              tail -n 60 configure.log | cut -c1-240
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-pages-artifact@v3
         with:
