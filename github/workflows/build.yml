@@ -1,0 +1,326 @@
+name: Build Arx Libertatis (WebAssembly)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+          actions-cache-folder: emsdk-cache
+
+      - name: Dependências do host (só cabeçalhos de Boost e GLM)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libboost-dev libglm-dev
+          mkdir -p hostinc
+          cp -r /usr/include/boost hostinc/boost
+          cp -r /usr/include/glm hostinc/glm
+
+      - name: Descompactar e aplicar patches
+        run: |
+          set -e
+          unzip -q ArxLibertatis-1_2_1.zip -d unz
+          mv unz/ArxLibertatis-1.2.1 arx-src
+          mkdir -p web
+          cat > patch_arx.py <<'ARX_EOF'
+          #!/usr/bin/env python3
+          """Patches Arx Libertatis 1.2.1 so it can be configured/compiled with Emscripten.
+          Every replacement must match exactly once, otherwise the script aborts loudly."""
+          import sys, pathlib
+
+          root = pathlib.Path(sys.argv[1])
+          inc  = sys.argv[2]  # dir containing copied boost/ and glm/ headers
+
+          def patch(rel, old, new, count=1):
+              p = root / rel
+              s = p.read_text()
+              n = s.count(old)
+              if n != count:
+                  sys.exit("PATCH FAILED in %s: expected %d match(es), found %d for:\n%s" % (rel, count, n, old))
+              p.write_text(s.replace(old, new))
+              print("ok:", rel, "->", old.strip().splitlines()[0][:60])
+
+          cm = "CMakeLists.txt"
+
+          # 1. Emscripten presets placed right before the OpenGL detection
+          patch(cm, "# OpenGL\nif(USE_OPENGL)\n",
+          """# Emscripten: GL, SDL2, OpenAL, zlib and FreeType come from emscripten ports/system libs
+          if(EMSCRIPTEN)
+          	set(ARX_HAVE_OPENGL 1)
+          	set(ARX_HAVE_GL_STATIC 1)
+          	set(ARX_HAVE_SDL2 1)
+          	set(ARX_HAVE_SDL 1)
+          	set(OPENAL_FOUND 1)
+          	set(OPENAL_LIBRARY openal)
+          	set(OPENAL_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/src")
+          	set(OPENGL_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/src")
+          	set(SDL2_INCLUDE_DIRS "${PROJECT_SOURCE_DIR}/src")
+          	set(SDL2_LIBRARIES "")
+          endif()
+
+          # OpenGL
+          if(USE_OPENGL)
+          """)
+
+          # 2. OpenAL lookup must not override the presets
+          patch(cm, "\tfind_package(OpenAL ${OPTIONAL_DEPENDENCY})\n\tfind_package(OpenALEFX)\n\tif(NOT MSVC AND OPENAL_FOUND)\n\t\tcheck_link_library(OpenAL OPENAL_LIBRARY)\n\tendif()\n",
+          "\tif(NOT EMSCRIPTEN)\n\tfind_package(OpenAL ${OPTIONAL_DEPENDENCY})\n\tfind_package(OpenALEFX)\n\tif(NOT MSVC AND OPENAL_FOUND)\n\t\tcheck_link_library(OpenAL OPENAL_LIBRARY)\n\tendif()\n\tendif()\n")
+
+          # 3. zlib
+          patch(cm, "use_static_libs(ZLIB)\nfind_package(ZLIB REQUIRED)\nuse_static_libs_restore()\nif(MSVC)\n\tadd_definitions(-DZLIB_WINAPI)\nelse()\n\tcheck_link_library(ZLIB ZLIB_LIBRARIES)\nendif()\n",
+          "if(EMSCRIPTEN)\n\tset(ZLIB_FOUND 1)\n\tset(ZLIB_LIBRARIES \"\")\n\tset(ZLIB_INCLUDE_DIRS \"${PROJECT_SOURCE_DIR}/src\")\nelse()\nuse_static_libs(ZLIB)\nfind_package(ZLIB REQUIRED)\nuse_static_libs_restore()\nif(MSVC)\n\tadd_definitions(-DZLIB_WINAPI)\nelse()\n\tcheck_link_library(ZLIB ZLIB_LIBRARIES)\nendif()\nendif()\n")
+
+          # 4. FreeType: skip the whole detection block under Emscripten
+          a = (root / cm).read_text()
+          start = a.index("# FreeType\nuse_static_libs(Freetype)\n")
+          endmark = "list(APPEND ARX_LIBRARIES ${FREETYPE_LIBRARIES})\n"
+          end = a.index(endmark, start) + len(endmark)
+          block = a[start:end]
+          new_block = ("if(EMSCRIPTEN)\n\tset(FREETYPE_LIBRARIES \"\")\n\tset(FREETYPE_INCLUDE_DIRS \"${PROJECT_SOURCE_DIR}/src\")\nelse()\n"
+                       + block + "endif()\n")
+          (root / cm).write_text(a[:start] + new_block + a[end:])
+          print("ok: CMakeLists.txt -> FreeType block wrapped")
+
+          # 5. Boost and GLM (header-only, copied from the host into ${inc})
+          patch(cm, "find_package(Boost 1.48 REQUIRED)\ninclude_directories(SYSTEM ${Boost_INCLUDE_DIRS})\n",
+          "if(EMSCRIPTEN)\n\tset(Boost_INCLUDE_DIRS \"%s\")\n\tset(Boost_VERSION_MACRO 108300)\nelse()\nfind_package(Boost 1.48 REQUIRED)\nendif()\ninclude_directories(SYSTEM ${Boost_INCLUDE_DIRS})\n" % inc)
+          patch(cm, "find_package(GLM 0.9.5.0 REQUIRED)\ninclude_directories(SYSTEM ${GLM_INCLUDE_DIRS})\n",
+          "if(EMSCRIPTEN)\n\tset(GLM_INCLUDE_DIRS \"%s\")\nelse()\nfind_package(GLM 0.9.5.0 REQUIRED)\nendif()\ninclude_directories(SYSTEM ${GLM_INCLUDE_DIRS})\n" % inc)
+
+          # 6. GL headers: use Emscripten's own GL/gl.h + GL/glext.h instead of epoxy/GLEW
+          patch("src/graphics/opengl/OpenGLUtil.h",
+          "#if ARX_HAVE_EPOXY\n#include <epoxy/gl.h>\n",
+          "#if defined(__EMSCRIPTEN__)\n#define GL_GLEXT_PROTOTYPES 1\n#include <GL/gl.h>\n#include <GL/glext.h>\n#elif ARX_HAVE_EPOXY\n#include <epoxy/gl.h>\n")
+          print("all patches applied")
+          ARX_EOF
+          cat > web/index.html <<'ARX_EOF'
+          <!doctype html>
+          <html lang="pt-BR">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+          <title>Arx Libertatis (WebAssembly)</title>
+          <style>
+            html,body{margin:0;height:100%;background:#0b0a09;color:#d8cfc0;font:16px system-ui,sans-serif;overflow:hidden;touch-action:none}
+            #menu{position:fixed;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;padding:24px;text-align:center}
+            button,label.btn{background:#6b4a1f;color:#fff;border:0;border-radius:10px;padding:14px 22px;font-size:16px}
+            button:disabled{opacity:.4}
+            #log{max-width:90vw;max-height:30vh;overflow:auto;font:12px monospace;text-align:left;white-space:pre-wrap;opacity:.8}
+            canvas{position:fixed;inset:0;width:100vw;height:100vh;background:#000;display:none}
+            #hud{position:fixed;inset:0;display:none;pointer-events:none}
+            #stick{position:absolute;left:calc(env(safe-area-inset-left) + 24px);bottom:calc(env(safe-area-inset-bottom) + 24px);width:140px;height:140px;border-radius:50%;background:rgba(255,255,255,.08);border:2px solid rgba(255,255,255,.25);pointer-events:auto}
+            #knob{position:absolute;left:45px;top:45px;width:50px;height:50px;border-radius:50%;background:rgba(255,255,255,.35)}
+            #look{position:absolute;right:0;top:0;width:55%;height:70%;pointer-events:auto}
+            #btns{position:absolute;right:16px;bottom:calc(env(safe-area-inset-bottom) + 16px);display:grid;grid-template-columns:repeat(3,64px);gap:10px;pointer-events:auto}
+            #btns div{height:56px;border-radius:12px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.3);display:flex;align-items:center;justify-content:center;font-size:13px;user-select:none}
+          </style>
+          </head>
+          <body>
+          <div id="menu">
+            <h2>Arx Libertatis</h2>
+            <p id="msg">Selecione os arquivos <b>.pak</b> da sua cópia do Arx Fatalis.</p>
+            <label class="btn">Escolher arquivos .pak<input id="pick" type="file" multiple accept=".pak" hidden></label>
+            <button id="go" disabled>Iniciar</button>
+            <div id="log"></div>
+          </div>
+          <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+          <div id="hud"><div id="stick"><div id="knob"></div></div><div id="look"></div><div id="btns"></div></div>
+          <script>
+          var $ = function (i) { return document.getElementById(i); };
+          var picked = [];
+
+          // Cross-origin isolation (needed for threads): register the helper worker and reload once.
+          (function () {
+            if (self.crossOriginIsolated || !('serviceWorker' in navigator)) return;
+            navigator.serviceWorker.register('coi-sw.js').then(function () {
+              try { if (!sessionStorage.getItem('coi')) { sessionStorage.setItem('coi', '1'); location.reload(); } } catch (e) {}
+            });
+          })();
+
+          function log(t) { var l = $('log'); l.textContent += t + '\n'; l.scrollTop = l.scrollHeight; }
+
+          $('pick').onchange = function (e) {
+            picked = Array.prototype.slice.call(e.target.files).filter(function (f) { return /\.pak$/i.test(f.name); });
+            var mb = picked.reduce(function (a, f) { return a + f.size; }, 0) / 1048576;
+            $('msg').textContent = picked.length + ' arquivo(s), ' + Math.round(mb) + ' MB' +
+              (mb > 1400 ? ' - atenção: pode faltar memória no celular' : '');
+            $('go').disabled = picked.length === 0;
+          };
+
+          $('go').onclick = function () {
+            $('go').disabled = true;
+            window.Module = {
+              canvas: $('canvas'), noInitialRun: true, print: log, printErr: log,
+              onRuntimeInitialized: function () { loadData().then(run).catch(function (e) { log('ERRO: ' + e); }); }
+            };
+            var s = document.createElement('script'); s.src = 'arx.js';
+            s.onerror = function () { log('Não achei arx.js (a build falhou?)'); };
+            document.body.appendChild(s);
+          };
+
+          async function loadData() {
+            var FS = Module.FS;
+            try { FS.mkdir('/game'); FS.mkdir('/user'); } catch (e) {}
+            for (var i = 0; i < picked.length; i++) {
+              var f = picked[i];
+              $('msg').textContent = 'Copiando ' + f.name + ' (' + (i + 1) + '/' + picked.length + ')';
+              var st = FS.open('/game/' + f.name, 'w');
+              var rd = f.stream().getReader();
+              for (;;) {
+                var x = await rd.read();
+                if (x.done) break;
+                FS.write(st, x.value, 0, x.value.length);
+              }
+              FS.close(st);
+            }
+          }
+
+          function run() {
+            $('menu').style.display = 'none';
+            $('canvas').style.display = 'block';
+            $('hud').style.display = 'block';
+            setupTouch();
+            Module.callMain(['-d', '/game', '-u', '/user', '-c', '/user']);
+          }
+
+          // ---- touch controls: synthetic keyboard/mouse events that SDL2 (Emscripten) listens to ----
+          var KEYS = { w: ['KeyW', 87], a: ['KeyA', 65], s: ['KeyS', 83], d: ['KeyD', 68] };
+          var BUTTONS = [
+            ['Pular', 'Space', ' ', 32], ['Esc', 'Escape', 'Escape', 27], ['I', 'KeyI', 'i', 73],
+            ['E', 'KeyE', 'e', 69], ['Ctrl', 'ControlLeft', 'Control', 17], ['Tab', 'Tab', 'Tab', 9]
+          ];
+          var held = {};
+          function sendKey(code, key, kc, down) {
+            var id = code;
+            if (down && held[id]) return;
+            if (!down && !held[id]) return;
+            held[id] = down;
+            window.dispatchEvent(new KeyboardEvent(down ? 'keydown' : 'keyup',
+              { code: code, key: key, keyCode: kc, which: kc, bubbles: true, cancelable: true }));
+          }
+          function mouse(type, target, x, y, dx, dy, btn) {
+            target.dispatchEvent(new MouseEvent(type, { clientX: x, clientY: y, movementX: dx || 0, movementY: dy || 0,
+              button: btn || 0, buttons: type === 'mouseup' ? 0 : 1 << (btn || 0), bubbles: true, cancelable: true }));
+          }
+
+          function setupTouch() {
+            var stick = $('stick'), knob = $('knob'), sid = null;
+            function stickMove(t) {
+              var r = stick.getBoundingClientRect(), cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+              var dx = t.clientX - cx, dy = t.clientY - cy, m = Math.min(1, Math.hypot(dx, dy) / 60), a = Math.atan2(dy, dx);
+              knob.style.left = 45 + Math.cos(a) * m * 45 + 'px'; knob.style.top = 45 + Math.sin(a) * m * 45 + 'px';
+              var on = m > 0.3;
+              sendKey('KeyW', 'w', 87, on && dy < -20); sendKey('KeyS', 's', 83, on && dy > 20);
+              sendKey('KeyA', 'a', 65, on && dx < -20); sendKey('KeyD', 'd', 68, on && dx > 20);
+            }
+            stick.addEventListener('touchstart', function (e) { e.preventDefault(); sid = e.changedTouches[0].identifier; stickMove(e.changedTouches[0]); }, { passive: false });
+            stick.addEventListener('touchmove', function (e) { e.preventDefault(); for (var i = 0; i < e.changedTouches.length; i++) if (e.changedTouches[i].identifier === sid) stickMove(e.changedTouches[i]); }, { passive: false });
+            function stickEnd(e) { e.preventDefault(); sid = null; knob.style.left = '45px'; knob.style.top = '45px';
+              ['w', 'a', 's', 'd'].forEach(function (k) { sendKey(KEYS[k][0], k, KEYS[k][1], false); }); }
+            stick.addEventListener('touchend', stickEnd, { passive: false });
+            stick.addEventListener('touchcancel', stickEnd, { passive: false });
+
+            // right area: drag = look around, quick tap = left click
+            var look = $('look'), lid = null, lx = 0, ly = 0, t0 = 0, moved = 0;
+            look.addEventListener('touchstart', function (e) { e.preventDefault(); var t = e.changedTouches[0]; lid = t.identifier; lx = t.clientX; ly = t.clientY; t0 = Date.now(); moved = 0; }, { passive: false });
+            look.addEventListener('touchmove', function (e) { e.preventDefault();
+              for (var i = 0; i < e.changedTouches.length; i++) { var t = e.changedTouches[i]; if (t.identifier !== lid) continue;
+                var dx = t.clientX - lx, dy = t.clientY - ly; lx = t.clientX; ly = t.clientY; moved += Math.abs(dx) + Math.abs(dy);
+                mouse('mousemove', document, t.clientX, t.clientY, dx, dy); } }, { passive: false });
+            look.addEventListener('touchend', function (e) { e.preventDefault();
+              if (moved < 12 && Date.now() - t0 < 300) { mouse('mousedown', $('canvas'), lx, ly, 0, 0, 0); mouse('mouseup', document, lx, ly, 0, 0, 0); } }, { passive: false });
+
+            BUTTONS.forEach(function (b) {
+              var d = document.createElement('div'); d.textContent = b[0]; $('btns').appendChild(d);
+              function dn(e) { e.preventDefault(); sendKey(b[1], b[2], b[3], true); }
+              function up(e) { e.preventDefault(); sendKey(b[1], b[2], b[3], false); }
+              d.addEventListener('touchstart', dn, { passive: false });
+              d.addEventListener('touchend', up, { passive: false });
+              d.addEventListener('touchcancel', up, { passive: false });
+            });
+          }
+          </script>
+          </body>
+          </html>
+          ARX_EOF
+          cat > web/coi-sw.js <<'ARX_EOF'
+          // Service worker that adds the headers needed for SharedArrayBuffer (pthreads) on hosts like GitHub Pages.
+          self.addEventListener('install', function () { self.skipWaiting(); });
+          self.addEventListener('activate', function (e) { e.waitUntil(self.clients.claim()); });
+          self.addEventListener('fetch', function (e) {
+            if (e.request.cache === 'only-if-cached' && e.request.mode !== 'same-origin') return;
+            e.respondWith(fetch(e.request).then(function (r) {
+              if (r.status === 0) return r;
+              var h = new Headers(r.headers);
+              h.set('Cross-Origin-Embedder-Policy', 'require-corp');
+              h.set('Cross-Origin-Opener-Policy', 'same-origin');
+              return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+            }));
+          });
+          ARX_EOF
+          python3 patch_arx.py "$PWD/arx-src" "$PWD/hostinc"
+
+      - name: Configurar (CMake + Emscripten)
+        run: |
+          set -o pipefail
+          COMMON="-O2 -pthread -fexceptions -sUSE_SDL=2 -sUSE_ZLIB=1 -sUSE_FREETYPE=1"
+          emcmake cmake -S arx-src -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXECUTABLE_SUFFIX=.js \
+            -DCMAKE_C_FLAGS="$COMMON" \
+            -DCMAKE_CXX_FLAGS="$COMMON" \
+            -DCMAKE_EXE_LINKER_FLAGS="$COMMON -lopenal -sLEGACY_GL_EMULATION=1 -sMIN_WEBGL_VERSION=1 -sMAX_WEBGL_VERSION=2 -sASYNCIFY=1 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=536870912 -sMAXIMUM_MEMORY=2147483648 -sPTHREAD_POOL_SIZE=4 -sFORCE_FILESYSTEM=1 -sINVOKE_RUN=0 -sEXIT_RUNTIME=0 -sEXPORTED_RUNTIME_METHODS=FS,callMain" \
+            -DBUILD_TOOLS=OFF -DBUILD_CRASHHANDLER=OFF -DBUILD_CRASHREPORTER=OFF \
+            -DBUILD_IO_LIBRARY=OFF -DBUILD_TESTS=OFF -DBUILD_PROFILER=OFF \
+            -DINSTALL_BLENDER_PLUGIN=OFF -DINSTALL_SCRIPTS=OFF -DICON_TYPE=none \
+            -DUSE_NATIVE_FS=ON -DUNITY_BUILD=OFF -DUSE_LTO=OFF -DUSE_LDGOLD=OFF \
+            -DSET_OPTIMIZATION_FLAGS=OFF -DSET_WARNING_FLAGS=OFF -DSTRICT_USE=OFF -DFASTLINK=OFF \
+            2>&1 | tee configure.log
+
+      - name: Compilar
+        run: |
+          set -o pipefail
+          cmake --build build -j"$(nproc)" 2>&1 | tee build.log
+
+      - name: Juntar arquivos do site
+        run: |
+          set -e
+          find build -maxdepth 2 -name 'arx.*' | sort
+          cp build/arx.js build/arx.wasm web/
+          cp build/arx.worker.js web/ 2>/dev/null || true
+          touch web/.nojekyll
+
+      - name: Resumo do erro (se falhou)
+        if: failure()
+        run: |
+          echo '### Últimas linhas do log' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          (tail -n 60 build.log 2>/dev/null || tail -n 60 configure.log 2>/dev/null || echo 'sem log') >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.dep.outputs.page_url }}
+    steps:
+      - id: dep
+        uses: actions/deploy-pages@v4
